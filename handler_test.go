@@ -131,4 +131,5 @@ func TestServeMux_handleConnection(t *testing.T) {
 			}
 		})
 	}
+	wg.Wait()
 }
