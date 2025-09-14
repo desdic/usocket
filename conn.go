@@ -28,8 +28,8 @@ type Connection struct {
 	conn net.Conn
 }
 
-func (c *Connection) Write(data []byte) {
-	c.conn.Write(data)
+func (c *Connection) Write(data []byte) (int, error) {
+	return c.conn.Write(data)
 }
 
 func (c *Connection) ReadLine(bufsize int) (string, error) {
