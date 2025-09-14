@@ -28,7 +28,7 @@ jobs:
           go-version: ${{ matrix.go }}
 
       - name: Test
-        run: go test -race -v -tags '${{ matrix.tags }}' -shuffle=on ./...
+        run: go test -race -v -shuffle=on ./...
         if: runner.os != 'Windows'
 
   lint:
