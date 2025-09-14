@@ -80,14 +80,17 @@ func TestServeMux_handleConnection(t *testing.T) {
 	var wg sync.WaitGroup
 
 	mux := NewRouter()
-	mux.HandleFunc(
+	if err := mux.HandleFunc(
 		"^testing",
 		func(c *Connection, r *Request) {
-			c.Write([]byte("testing handler"))
-			c.Close()
+			_, _ = c.Write([]byte("testing handler"))
+			_ = c.Close()
 		},
-	)
-	mux.HandleFunc(
+	); err != nil {
+		t.Fatalf("failed to setup test for testing handler: %v", err)
+	}
+
+	if err := mux.HandleFunc(
 		"^add (?P<username>c[a-z0-9]{8}) (?P<group>w[a-z0-9]{10})$",
 		func(c *Connection, r *Request) {
 			ret := []byte("group")
@@ -100,13 +103,15 @@ func TestServeMux_handleConnection(t *testing.T) {
 			ret = append(ret, space...)
 			ret = append(ret, group...)
 
-			c.Write(ret)
-			c.Close()
+			_, _ = c.Write(ret)
+			_ = c.Close()
 		},
-	)
+	); err != nil {
+		t.Fatalf("failed to setup test for group handler: %v", err)
+	}
 	mux.HandleDefaultFunc(func(c *Connection, r *Request) {
-		c.Write([]byte("not found"))
-		c.Close()
+		_, _ = c.Write([]byte("not found"))
+		_ = c.Close()
 	})
 	ctx := context.Background()
 

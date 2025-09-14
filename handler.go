@@ -37,13 +37,11 @@ func NewRouter() ServeMux {
 	}
 }
 
-func (mux *ServeMux) HandleDefaultFunc(handler HandlerFunc) error {
+func (mux *ServeMux) HandleDefaultFunc(handler HandlerFunc) {
 	mux.mu.Lock()
 	defer mux.mu.Unlock()
 
 	mux.defaultHandler = handler
-
-	return nil
 }
 
 func (mux *ServeMux) HandleFunc(pattern string, handler HandlerFunc) error {
@@ -126,7 +124,7 @@ func (mux *ServeMux) ListenAndServe(ctx context.Context, socketpath string) erro
 	// Setup default handler to just close the connection
 	if mux.defaultHandler != nil {
 		mux.defaultHandler = func(c *Connection, _ *Request) {
-			c.Close()
+			_ = c.Close()
 		}
 	}
 
@@ -141,7 +139,7 @@ func (mux *ServeMux) ListenAndServe(ctx context.Context, socketpath string) erro
 
 	go func() {
 		<-ctx.Done()
-		listener.Close()
+		_ = listener.Close()
 	}()
 
 	for {

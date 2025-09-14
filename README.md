@@ -1,5 +1,7 @@
 # Usocket
 
+![Test](https://github.com/desdic/usocket/actions/workflows/ci.yml/badge.svg)
+
 Handle UNIX socket in a similar way go handles http
 
 example
