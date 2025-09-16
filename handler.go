@@ -21,6 +21,10 @@ func (r Request) Get(key string) string {
 	return r.vars[key]
 }
 
+func (r Request) GetRawLine() string {
+	return r.rawLine
+}
+
 type HandlerFunc func(w *Connection, r *Request)
 
 type ServeMux struct {
