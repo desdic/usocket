@@ -1,5 +1,6 @@
 //go:build darwin || linux
 
+// Package usocket implement a mux for handleing sockets in a similar way as go handles http
 package usocket
 
 import (
@@ -10,6 +11,7 @@ import (
 	"sync"
 )
 
+// BUFSIZE default buffer size when using NewRouter
 const BUFSIZE = 512
 
 type Request struct {
@@ -17,14 +19,18 @@ type Request struct {
 	rawLine string
 }
 
+// Get returns a matching capture group from the request
 func (r Request) Get(key string) string {
 	return r.vars[key]
 }
 
+// GetRawLine returns the full line from the request
+// usefull in logging in the default handler when no match is found
 func (r Request) GetRawLine() string {
 	return r.rawLine
 }
 
+// HandlerFunc is the definition of a function for the HandlerFunc/HandleDefaultFunc
 type HandlerFunc func(w *Connection, r *Request)
 
 type ServeMux struct {
@@ -34,6 +40,7 @@ type ServeMux struct {
 	bufsize        int
 }
 
+// NewRouter creates a new socket router
 func NewRouter() ServeMux {
 	return ServeMux{
 		reg:     make(map[*regexp.Regexp]HandlerFunc),
@@ -41,6 +48,8 @@ func NewRouter() ServeMux {
 	}
 }
 
+// HandleDefaultFunc sets the default handling of request not matching
+// any patterns added by HandleFunc
 func (mux *ServeMux) HandleDefaultFunc(handler HandlerFunc) {
 	mux.mu.Lock()
 	defer mux.mu.Unlock()
@@ -48,6 +57,7 @@ func (mux *ServeMux) HandleDefaultFunc(handler HandlerFunc) {
 	mux.defaultHandler = handler
 }
 
+// HandleFunc adds a HandleFunc to a specific pattern (regex)
 func (mux *ServeMux) HandleFunc(pattern string, handler HandlerFunc) error {
 	re, err := regexp.Compile(pattern)
 	if err != nil {
@@ -118,6 +128,7 @@ func (mux *ServeMux) handleConnection(ctx context.Context, conn net.Conn, wg *sy
 	}
 }
 
+// ListenAndServe starts the socket router
 func (mux *ServeMux) ListenAndServe(ctx context.Context, socketpath string) error {
 	var (
 		wg       sync.WaitGroup
