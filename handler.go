@@ -137,7 +137,7 @@ func (mux *ServeMux) ListenAndServe(ctx context.Context, socketpath string) erro
 	)
 
 	// Setup default handler to just close the connection
-	if mux.defaultHandler != nil {
+	if mux.defaultHandler == nil {
 		mux.defaultHandler = func(c *Connection, _ *Request) {
 			_ = c.Close()
 		}
