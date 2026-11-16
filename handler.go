@@ -5,14 +5,28 @@ package usocket
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"regexp"
 	"sync"
+	"syscall"
+	"time"
 )
 
-// BUFSIZE default buffer size when using NewRouter
-const BUFSIZE = 512
+const (
+	// BUFSIZE default buffer size when using NewRouter
+	BUFSIZE = 512
+
+	// DefaultReadTimeout is the read timeout used when none is set
+	DefaultReadTimeout = 10 * time.Second
+
+	// DefaultWriteTimeout is the write timeout used when none is set
+	DefaultWriteTimeout = 10 * time.Second
+
+	minAcceptBackoff = 5 * time.Millisecond
+	maxAcceptBackoff = time.Second
+)
 
 type Request struct {
 	vars    map[string]string
@@ -38,6 +52,9 @@ type ServeMux struct {
 	defaultHandler HandlerFunc
 	mu             sync.RWMutex
 	bufsize        int
+	readTimeout    time.Duration
+	writeTimeout   time.Duration
+	maxConns       int
 }
 
 // NewRouter creates a new socket router
@@ -46,6 +63,35 @@ func NewRouter() ServeMux {
 		reg:     make(map[*regexp.Regexp]HandlerFunc),
 		bufsize: BUFSIZE,
 	}
+}
+
+// SetReadTimeout sets how long each read from a connection may wait for data,
+// including reading the request line. Zero uses DefaultReadTimeout and a
+// negative value disables the timeout.
+func (mux *ServeMux) SetReadTimeout(d time.Duration) {
+	mux.mu.Lock()
+	defer mux.mu.Unlock()
+
+	mux.readTimeout = d
+}
+
+// SetWriteTimeout sets how long each write to a connection may block. Zero
+// uses DefaultWriteTimeout and a negative value disables the timeout.
+func (mux *ServeMux) SetWriteTimeout(d time.Duration) {
+	mux.mu.Lock()
+	defer mux.mu.Unlock()
+
+	mux.writeTimeout = d
+}
+
+// SetMaxConnections limits how many connections are handled at once. When the
+// limit is reached, new connections wait in the listen backlog until a slot
+// frees up. Zero or a negative value means no limit.
+func (mux *ServeMux) SetMaxConnections(n int) {
+	mux.mu.Lock()
+	defer mux.mu.Unlock()
+
+	mux.maxConns = n
 }
 
 // HandleDefaultFunc sets the default handling of request not matching
@@ -76,22 +122,48 @@ func (mux *ServeMux) HandleFunc(pattern string, handler HandlerFunc) error {
 	return nil
 }
 
+// resolveTimeout maps a configured timeout to the effective one:
+// zero means the default, negative means disabled (0).
+func resolveTimeout(d, def time.Duration) time.Duration {
+	switch {
+	case d == 0:
+		return def
+	case d < 0:
+		return 0
+	default:
+		return d
+	}
+}
+
 func (mux *ServeMux) handleConnection(ctx context.Context, conn net.Conn, wg *sync.WaitGroup) {
 	defer wg.Done()
+	defer func() { _ = conn.Close() }()
 
 	err := ctx.Err()
 	if err != nil {
 		return
 	}
 
-	cmdLine, err := readLine(conn, mux.bufsize)
+	mux.mu.RLock()
+	w := Connection{
+		conn:         conn,
+		readTimeout:  resolveTimeout(mux.readTimeout, DefaultReadTimeout),
+		writeTimeout: resolveTimeout(mux.writeTimeout, DefaultWriteTimeout),
+	}
+	bufsize := mux.bufsize
+	mux.mu.RUnlock()
+
+	if bufsize <= 0 {
+		bufsize = BUFSIZE
+	}
+
+	cmdLine, err := w.ReadLine(bufsize)
 	if err != nil {
 		return
 	}
 
 	var (
 		matches   []string
-		rematch   *regexp.Regexp
 		funcMatch HandlerFunc
 		r         Request
 	)
@@ -102,7 +174,6 @@ func (mux *ServeMux) handleConnection(ctx context.Context, conn net.Conn, wg *sy
 	for re, f := range mux.reg {
 		matches = re.FindStringSubmatch(cmdLine)
 		if len(matches) > 0 {
-			rematch = re
 			funcMatch = f
 			r.vars = make(map[string]string)
 			subexpNames := re.SubexpNames()
@@ -114,63 +185,169 @@ func (mux *ServeMux) handleConnection(ctx context.Context, conn net.Conn, wg *sy
 			break
 		}
 	}
+	if funcMatch == nil {
+		funcMatch = mux.defaultHandler
+	}
 	mux.mu.RUnlock()
 
-	w := Connection{conn: conn}
-
-	if rematch != nil {
+	if funcMatch != nil {
 		funcMatch(&w, &r)
-		return
-	}
-
-	if mux.defaultHandler != nil {
-		mux.defaultHandler(&w, &r)
 	}
 }
 
-// ListenAndServe starts the socket router
-func (mux *ServeMux) ListenAndServe(ctx context.Context, socketpath string) error {
-	var (
-		wg       sync.WaitGroup
-		err      error
-		listener net.Listener
-	)
+// isTemporaryAcceptErr reports whether an Accept error is transient, such as
+// running out of file descriptors, so the accept loop should back off and
+// retry instead of stopping.
+func isTemporaryAcceptErr(err error) bool {
+	for _, errno := range []syscall.Errno{
+		syscall.EMFILE, syscall.ENFILE, syscall.ENOBUFS,
+		syscall.ENOMEM, syscall.ECONNABORTED, syscall.EINTR,
+	} {
+		if errors.Is(err, errno) {
+			return true
+		}
+	}
 
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// ListenAndServe creates a unix socket at socketpath and serves it until ctx
+// is cancelled. See Serve.
+func (mux *ServeMux) ListenAndServe(ctx context.Context, socketpath string) error {
+	listener, err := net.Listen("unix", socketpath)
+	if err != nil {
+		return fmt.Errorf("failed to open socket: %w", err)
+	}
+
+	return mux.Serve(ctx, listener)
+}
+
+// Serve accepts connections on listener and dispatches them to handlers until
+// ctx is cancelled or the listener fails. Transient accept errors (such as
+// running out of file descriptors) are retried with backoff.
+//
+// When ctx is cancelled, the listener and all open connections are closed and
+// Serve waits for running handlers to return before returning nil. If the
+// listener fails with a non-transient error, Serve shuts down the same way and
+// returns that error.
+func (mux *ServeMux) Serve(ctx context.Context, listener net.Listener) error {
+	mux.mu.Lock()
 	// Setup default handler to just close the connection
 	if mux.defaultHandler == nil {
 		mux.defaultHandler = func(c *Connection, _ *Request) {
 			_ = c.Close()
 		}
 	}
-
 	if mux.bufsize == 0 {
 		mux.bufsize = BUFSIZE
 	}
+	maxConns := mux.maxConns
+	mux.mu.Unlock()
 
-	listener, err = net.Listen("unix", socketpath)
-	if err != nil {
-		return fmt.Errorf("failed to open socket: %w", err)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var (
+		wg      sync.WaitGroup
+		connsMu sync.Mutex
+		conns   = make(map[net.Conn]struct{})
+		closing bool
+		sem     chan struct{}
+		retErr  error
+		backoff time.Duration
+	)
+
+	if maxConns > 0 {
+		sem = make(chan struct{}, maxConns)
 	}
 
+	stopped := make(chan struct{})
 	go func() {
+		defer close(stopped)
 		<-ctx.Done()
 		_ = listener.Close()
+
+		connsMu.Lock()
+		closing = true
+		for c := range conns {
+			_ = c.Close()
+		}
+		connsMu.Unlock()
 	}()
 
 	for {
-		if err := ctx.Err(); err != nil {
+		if sem != nil {
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+			}
+		}
+
+		if ctx.Err() != nil {
 			break
 		}
 
 		conn, err := listener.Accept()
 		if err != nil {
+			if sem != nil {
+				<-sem
+			}
+
+			if ctx.Err() != nil {
+				break
+			}
+
+			if isTemporaryAcceptErr(err) {
+				if backoff == 0 {
+					backoff = minAcceptBackoff
+				} else {
+					backoff = min(backoff*2, maxAcceptBackoff)
+				}
+
+				select {
+				case <-time.After(backoff):
+				case <-ctx.Done():
+				}
+				continue
+			}
+
+			retErr = fmt.Errorf("failed to accept connection: %w", err)
 			break
 		}
+		backoff = 0
+
+		connsMu.Lock()
+		if closing {
+			connsMu.Unlock()
+			_ = conn.Close()
+			if sem != nil {
+				<-sem
+			}
+			break
+		}
+		conns[conn] = struct{}{}
+		connsMu.Unlock()
 
 		wg.Add(1)
+		go func() {
+			defer func() {
+				connsMu.Lock()
+				delete(conns, conn)
+				connsMu.Unlock()
 
-		go mux.handleConnection(ctx, conn, &wg)
+				if sem != nil {
+					<-sem
+				}
+			}()
+
+			mux.handleConnection(ctx, conn, &wg)
+		}()
 	}
 
-	return err
+	cancel()
+	<-stopped
+	wg.Wait()
+
+	return retErr
 }
